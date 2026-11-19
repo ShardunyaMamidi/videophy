@@ -16,4 +16,3 @@ peft
 opencv-python
 decord
 chardet
-cchardet

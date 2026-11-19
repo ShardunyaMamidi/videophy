@@ -16,6 +16,8 @@ from mplug_owl_video.modeling_mplug_owl import MplugOwlForConditionalGeneration
 from mplug_owl_video.processing_mplug_owl import MplugOwlImageProcessor, MplugOwlProcessor
 from template import *
 
+from accelerate.hooks import remove_hook_from_submodules
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--input_csv', type = str, required = True, help = 'csv')
@@ -51,8 +53,8 @@ def inference(args, model, df, processor, tokenizer):
             else:
                 prompts = [PROMPT_RULE.format(rule=row['rule'])]
             inputs = processor(text=prompts, videos=videopaths, num_frames=args.num_frames, return_tensors='pt')
-            inputs = {k: v.bfloat16() if v.dtype == torch.float else v for k, v in inputs.items()}
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            inputs = {k: v.half() if v.dtype == torch.float else v for k, v in inputs.items()}
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
             res = model.generate(**inputs, **generate_kwargs)
             output = tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
             output_lower = output.lower().strip()
@@ -108,11 +110,34 @@ def main():
     # Instantiate model
     model = MplugOwlForConditionalGeneration.from_pretrained(
         checkpoint,
-        torch_dtype=torch.bfloat16,
-        device_map={'': 'cpu'}
+        torch_dtype=torch.float16,
+        load_in_8bit=True,
+        device_map={"":0}
     )
     print('Model Loaded')
     model.eval()
+
+    # 1. Materialize any weights offloaded by accelerate hooks directly onto cuda:0
+    for mod in model.modules():
+        hook = getattr(mod, "_hf_hook", None)
+        if hook is not None and getattr(hook, "weights_map", None) is not None:
+            for k in list(hook.weights_map.keys()):
+                tensor = hook.weights_map[k].to("cuda:0")
+                if k in mod._parameters:
+                    mod._parameters[k] = torch.nn.Parameter(tensor, requires_grad=False)
+                elif k in mod._buffers:
+                    mod._buffers[k] = tensor
+
+    # 2. Remove accelerate's AlignDevicesHook wrappers so weights stay on cuda:0 during forward()
+    remove_hook_from_submodules(model)
+
+    # 3. Move any remaining non-quantized parameters/buffers to cuda:0
+    for param in model.parameters():
+        if param.device.type != "cuda":
+            param.data = param.data.to("cuda:0")
+    for buf in model.buffers():
+        if buf.device.type != "cuda":
+            buf.data = buf.data.to("cuda:0")
 
     lora_checkpoint = args.lora_checkpoint
     if lora_checkpoint:
@@ -133,7 +158,7 @@ def main():
             ckpt = modify_keys(ckpt)
             model.load_state_dict(ckpt)
         print("LOADED")
-    model = model.to("cuda").to(torch.bfloat16)
+    # model = model.to("cuda").to(torch.bfloat16)
     
     out = inference(args, model, df, processor, tokenizer)
     out.to_csv(args.output_csv)
